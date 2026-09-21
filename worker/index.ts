@@ -50,8 +50,15 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
   };
 
   private realtime = new RealtimeCommentator();
-  private producing = false;
+  // The Realtime session voices one line at a time, so productions are chained
+  // rather than rejected: a click landing mid-sentence still gets commentary.
+  private chain: Promise<unknown> = Promise.resolve();
+  private inFlight = 0;
   private revision = 0;
+
+  private get producing() {
+    return this.inFlight > 0;
+  }
 
   async onStart() {
     // Idempotent: one interval survives hibernation and restarts.
@@ -64,8 +71,10 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
     eventId: string = crypto.randomUUID()
   ): Promise<BroadcastClip> {
     if (!eventText.trim() || !eventId.trim()) throw new Error("An event ID and action description are required");
-    if (this.producing || this.state.pendingClipId) {
-      throw new Error("Finish the current commentary before submitting another action");
+    // An unacknowledged clip means the listener moved on without playing it out;
+    // the newest action matters more than the one it interrupted.
+    if (this.state.pendingClipId) {
+      this.setState({ ...this.state, pendingClipId: null });
     }
     const event: UserAction = {
       id: eventId,
@@ -89,8 +98,12 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
     if (!["active", "idle", "stopped"].includes(status)) {
       throw new Error("Invalid playback status");
     }
-    this.revision += 1;
-    if (status === "stopped") this.realtime.close();
+    // Only a stop invalidates work in flight. Tabs come and go independently,
+    // so one tab going active must not cancel the line another tab is awaiting.
+    if (status === "stopped") {
+      this.revision += 1;
+      this.realtime.close();
+    }
     this.setState({
       ...this.state,
       onAir: status !== "stopped",
@@ -145,42 +158,49 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
     }
   }
 
-  private async produce(
+  private produce(kind: "event" | "dead-air", event: UserAction): Promise<BroadcastClip> {
+    this.inFlight += 1;
+    const run = this.chain
+      .catch(() => {})
+      .then(() => this.speak(kind, event))
+      .finally(() => {
+        this.inFlight -= 1;
+      });
+    this.chain = run.catch(() => {});
+    return run;
+  }
+
+  private async speak(
     kind: "event" | "dead-air",
     event: UserAction
   ): Promise<BroadcastClip> {
-    this.producing = true;
     const revision = this.revision;
-    try {
-      return await this.keepAliveWhile(async () => {
-        if (revision !== this.revision) throw new Error("Broadcast was cancelled");
-        const prompt = kind === "event" ? actionPrompt(event.text) : deadAirPrompt(event.text);
-        const line = await this.realtime.commentate(this.env, prompt);
-        if (revision !== this.revision) throw new Error("Broadcast was cancelled");
+    return this.keepAliveWhile(async () => {
+      if (revision !== this.revision) throw new Error("Broadcast was cancelled");
+      const prompt = kind === "event" ? actionPrompt(event.text) : deadAirPrompt(event.text);
+      const line = await this.realtime.commentate(this.env, prompt);
+      if (revision !== this.revision) throw new Error("Broadcast was cancelled");
 
-        const segment: Segment = {
-          id: crypto.randomUUID(),
-          speakerName: COMMENTATOR.name,
-          text: line.text,
-          kind,
-          eventId: event.id,
-          eventText: event.text,
-          at: Date.now()
-        };
+      const segment: Segment = {
+        id: crypto.randomUUID(),
+        speakerName: COMMENTATOR.name,
+        text: line.text,
+        kind,
+        eventId: event.id,
+        eventText: event.text,
+        at: Date.now()
+      };
 
-        this.setState({
-          ...this.state,
-          transcript: [...this.state.transcript, segment].slice(-HISTORY_LIMIT),
-          pendingClipId: segment.id
-        });
-
-        const clip: BroadcastClip = { ...segment, audio: line.audio, mimeType: "audio/wav" };
-        this.broadcast(JSON.stringify({ type: "clip", clip }));
-        return clip;
+      this.setState({
+        ...this.state,
+        transcript: [...this.state.transcript, segment].slice(-HISTORY_LIMIT),
+        pendingClipId: segment.id
       });
-    } finally {
-      this.producing = false;
-    }
+
+      const clip: BroadcastClip = { ...segment, audio: line.audio, mimeType: "audio/wav" };
+      this.broadcast(JSON.stringify({ type: "clip", clip }));
+      return clip;
+    });
   }
 }
 
