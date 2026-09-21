@@ -3,9 +3,18 @@
 const WORKER_ORIGIN = "http://localhost:8787";
 
 let sessionId = null;
-let live = false;
-let liveTabId = null;
 let pushSocket = null;
+
+// The service worker is evicted after ~30s idle, so anything kept in a module
+// global is lost while the user is still listening. Session storage survives it.
+async function getLive() {
+  const stored = await chrome.storage.session.get(["live", "liveTabId"]);
+  return { live: stored.live === true, liveTabId: stored.liveTabId ?? null };
+}
+
+async function setLive(live, liveTabId) {
+  await chrome.storage.session.set({ live, liveTabId });
+}
 
 async function getSessionId() {
   if (sessionId) return sessionId;
@@ -33,16 +42,22 @@ async function openPushSocket() {
   const id = await getSessionId();
   const ws = new WebSocket(`${WORKER_ORIGIN.replace(/^http/, "ws")}/agents/broadcast-agent/${id}`);
   ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      if ((data.type === "clip" || data.type === "broadcast-error") && liveTabId !== null) {
-        chrome.tabs.sendMessage(liveTabId, { kind: "broadcast", data }).catch(() => {});
-      }
-    } catch {}
+    void (async () => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type !== "clip" && data.type !== "broadcast-error") return;
+        const { liveTabId } = await getLive();
+        if (liveTabId !== null) {
+          chrome.tabs.sendMessage(liveTabId, { kind: "broadcast", data }).catch(() => {});
+        }
+      } catch {}
+    })();
   };
   ws.onclose = () => {
     pushSocket = null;
-    if (live) setTimeout(() => openPushSocket().catch(() => {}), 3000);
+    void getLive().then(({ live }) => {
+      if (live) setTimeout(() => openPushSocket().catch(() => {}), 3000);
+    });
   };
   ws.onerror = () => {};
   pushSocket = ws;
@@ -55,26 +70,26 @@ function closePushSocket() {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  const tabId = sender.tab?.id ?? liveTabId;
   (async () => {
+    const state = await getLive();
+    const tabId = sender.tab?.id ?? state.liveTabId;
     switch (message.kind) {
       case "start": {
-        live = true;
-        liveTabId = tabId;
+        await setLive(true, tabId);
         await openPushSocket();
         await call("setPlaybackStatus", ["idle"]);
         return { ok: true };
       }
       case "stop": {
-        live = false;
-        liveTabId = null;
+        await setLive(false, null);
         closePushSocket();
         await call("setPlaybackStatus", ["stopped"]).catch(() => {});
         return { ok: true };
       }
       case "action": {
-        if (!live) throw new Error("Commentary is not started");
-        liveTabId = tabId;
+        if (!state.live) throw new Error("Commentary is not started");
+        if (tabId !== state.liveTabId) await setLive(true, tabId);
+        await openPushSocket();
         const clip = await call("processEvent", [message.text]);
         return { clip };
       }
