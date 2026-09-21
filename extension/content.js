@@ -12,10 +12,25 @@ let idleTimer = null;
 
 // ---------------------------------------------------------------- describing
 
+// A form control's own text is its options or nothing, so ask its <label> first.
+function controlLabel(el) {
+  if (el.id) {
+    const tag = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+    const text = tag?.innerText?.trim().replace(/\s+/g, " ");
+    if (text) return text;
+  }
+  const wrapper = el.closest?.("label")?.innerText?.trim().replace(/\s+/g, " ");
+  return wrapper || "";
+}
+
 function label(el) {
   if (!el || el === document.body) return "the page";
   const aria = el.getAttribute?.("aria-label")?.trim();
   if (aria) return `"${aria}"`;
+  if (["SELECT", "INPUT", "TEXTAREA"].includes(el.tagName)) {
+    const named = controlLabel(el);
+    if (named) return `the "${named}" field`;
+  }
   const text = el.innerText?.trim().replace(/\s+/g, " ");
   if (text && text.length <= 60) return `"${text}"`;
   const placeholder = el.getAttribute?.("placeholder")?.trim();
@@ -119,13 +134,13 @@ async function playClip(clip) {
     });
   } finally {
     URL.revokeObjectURL(url);
-    if (live) setState("Listening");
   }
 }
 
 async function drain() {
   if (speaking) return;
   speaking = true;
+  let failed = false;
   try {
     while (live && queue.length) {
       const action = queue.shift();
@@ -135,16 +150,28 @@ async function drain() {
         if (reply?.error) throw new Error(reply.error);
         await playClip(reply.clip);
         await chrome.runtime.sendMessage({ kind: "ack", clipId: reply.clip.id });
+        failed = false;
       } catch (error) {
-        setState("Error", "error");
+        failed = true;
         console.warn("[sarcastic peer programmer]", error.message);
       }
     }
   } finally {
     speaking = false;
-    if (live) setState("Listening");
+    // Stay on Error until something works again: a silent pill that claims to be
+    // listening is worse than no pill at all.
+    if (live) failed ? setState("Error", "error") : setState("Listening");
     scheduleIdle();
   }
+}
+
+// Re-sending a status the worker already has bumps its revision and cancels the
+// line it is mid-way through generating, so only send transitions.
+let playbackStatus = null;
+function setPlaybackStatus(status) {
+  if (status === playbackStatus) return;
+  playbackStatus = status;
+  void chrome.runtime.sendMessage({ kind: "idle", status });
 }
 
 function report(action) {
@@ -153,16 +180,14 @@ function report(action) {
   // Only the newest action matters; never build a backlog of stale commentary.
   queue.length = 0;
   queue.push(action);
-  void chrome.runtime.sendMessage({ kind: "idle", status: "active" });
+  setPlaybackStatus("active");
   void drain();
 }
 
 function scheduleIdle() {
   clearTimeout(idleTimer);
   if (!live) return;
-  idleTimer = setTimeout(() => {
-    void chrome.runtime.sendMessage({ kind: "idle", status: "idle" });
-  }, IDLE_AFTER_MS);
+  idleTimer = setTimeout(() => setPlaybackStatus("idle"), IDLE_AFTER_MS);
 }
 
 // ------------------------------------------------------------------ watching
@@ -213,6 +238,8 @@ function onClick(event) {
   if (!el?.tagName) return;
   // A click into a text field is the start of typing, not an action worth voicing.
   if (typing.has(el) || isTextField(el)) return;
+  // Selects and toggles fire `change` too; that event describes the action better.
+  if (el.tagName === "SELECT" || el.type === "checkbox" || el.type === "radio") return;
   const disabled = el.disabled ? ", which is disabled and did nothing" : "";
   report(`The user clicked ${label(el)}, a ${kindOf(el)}${disabled}, on the page "${document.title}".`);
 }
@@ -257,6 +284,7 @@ async function start() {
     return;
   }
   live = true;
+  playbackStatus = "idle";
   for (const [type, handler, capture] of LISTENERS) {
     document.addEventListener(type, handler, capture);
   }
@@ -266,6 +294,7 @@ async function start() {
 
 function stop() {
   live = false;
+  playbackStatus = null;
   queue.length = 0;
   clearTimeout(idleTimer);
   for (const [type, handler, capture] of LISTENERS) {
