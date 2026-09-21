@@ -107,9 +107,35 @@ function overlay() {
     </div>`;
   document.documentElement.appendChild(host);
   const pill = root.querySelector(".pill");
-  ui = { pill, state: root.querySelector(".state") };
+  ui = { host, pill, state: root.querySelector(".state") };
   pill.addEventListener("click", () => (live ? stop() : start()));
   return ui;
+}
+
+// ------------------------------------------------------------- extension gone
+
+// Reloading the extension orphans this script: its listeners stay on the page
+// but every call into the extension throws "Extension context invalidated".
+// The fresh copy owns the page now, so this one retires quietly.
+function retire() {
+  live = false;
+  queue.length = 0;
+  clearTimeout(idleTimer);
+  for (const [type, handler, capture] of LISTENERS) {
+    document.removeEventListener(type, handler, capture);
+  }
+  ui?.host.remove();
+  ui = null;
+}
+
+async function send(message) {
+  if (!chrome.runtime?.id) return retire();
+  try {
+    return await chrome.runtime.sendMessage(message);
+  } catch (error) {
+    if (chrome.runtime?.id) throw error;
+    return retire();
+  }
 }
 
 function setState(text, className) {
@@ -152,10 +178,11 @@ async function drain() {
       const action = queue.shift();
       setState("Thinking");
       try {
-        const reply = await chrome.runtime.sendMessage({ kind: "action", text: action });
-        if (reply?.error) throw new Error(reply.error);
+        const reply = await send({ kind: "action", text: action });
+        if (!reply) return;
+        if (reply.error) throw new Error(reply.error);
         await playClip(reply.clip);
-        await chrome.runtime.sendMessage({ kind: "ack", clipId: reply.clip.id });
+        await send({ kind: "ack", clipId: reply.clip.id });
         failed = false;
       } catch (error) {
         failed = true;
@@ -177,7 +204,7 @@ let playbackStatus = null;
 function setPlaybackStatus(status) {
   if (status === playbackStatus) return;
   playbackStatus = status;
-  void chrome.runtime.sendMessage({ kind: "idle", status });
+  void send({ kind: "idle", status });
 }
 
 function report(action) {
@@ -283,8 +310,9 @@ const LISTENERS = [
 
 async function start() {
   setState("Connecting");
-  const reply = await chrome.runtime.sendMessage({ kind: "start" });
-  if (reply?.error) {
+  const reply = await send({ kind: "start" });
+  if (!reply) return;
+  if (reply.error) {
     setState("Offline", "error");
     console.warn("[sarcastic peer programmer]", reply.error);
     return;
@@ -307,7 +335,7 @@ function stop() {
     document.removeEventListener(type, handler, capture);
   }
   setState("Listen in");
-  void chrome.runtime.sendMessage({ kind: "stop" });
+  void send({ kind: "stop" });
 }
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -320,7 +348,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (data.type === "clip" && data.clip.kind === "dead-air" && !speaking) {
     void (async () => {
       await playClip(data.clip).catch(() => {});
-      await chrome.runtime.sendMessage({ kind: "ack", clipId: data.clip.id });
+      await send({ kind: "ack", clipId: data.clip.id });
     })();
   }
 });
