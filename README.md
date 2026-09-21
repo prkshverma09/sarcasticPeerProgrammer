@@ -1,79 +1,74 @@
-# DevinCast
+# Sarcastic Peer Programmer
 
-Live two-host **sports commentary** for an autonomous coding agent. A simulated coding
-session on the left ("The Pitch"), an ESPN-style broadcast booth on the right
-("The Broadcast") — commentary written by an LLM, voiced by ElevenLabs, and pushed to
-the browser in real time by a Cloudflare Durable Object.
+A Chrome extension with one opinionated commentator. She watches what you do on the
+current page — clicks, typed input, dropdowns, form submits, navigation — and says
+something dry about it out loud. Voice comes from the **OpenAI Realtime API**, spoken
+through a Cloudflare Worker so your API key never reaches the browser.
 
 ```
-Next.js (static export)  ──WebSocket RPC──>  BroadcastAgent (Durable Object)
-       │                                            │
-   audio playback  <── correlated RPC clip ─────────┤── LLM (OpenRouter / OpenAI)
-   retro visualizer                                 └── ElevenLabs TTS (mp3, base64)
+Chrome extension                 Cloudflare Worker
+  content.js  ──user action──>   BroadcastAgent (Durable Object)
+  (voice pill)                        │
+     ▲                                └── WebSocket ──> OpenAI Realtime (gpt-realtime)
+     └────── spoken WAV clip ─────────────────────────────  text + audio
 ```
 
-One Worker serves both the static frontend (`assets` binding) and the agent, so
-`npx wrangler dev` runs the whole app.
-
-## Backend — `worker/`
+## Worker — `worker/`
 
 - `BroadcastAgent extends Agent` (Cloudflare `agents` SDK, Durable Object + SQLite state).
-- State includes event and transcript history, speaker, playback status, and the unacknowledged clip ID.
-- `@callable() processEvent(eventText, eventId?)` — records the exact displayed terminal output, generates a grounded
-  reaction with the *next* speaker's persona, synthesizes it with that speaker's ElevenLabs
-  `voice_id`, broadcasts `{ type: "clip", clip }` to every connected client, and returns the
-  clip (base64 mp3 + transcript + event ID) to the caller. The frontend uses the RPC response
-  for event commentary and ignores the duplicate event push.
-- `acknowledgeClip(clipId)` releases the playback gate only after that audio ends.
-  Concurrent generation and new events during pending playback are rejected.
-- `setPlaybackStatus("active" | "idle" | "stopped")` controls broadcast lifecycle.
-  Connecting alone does not start a broadcast; disconnecting the last viewer stops it.
-- `scheduleEvery(30, "checkDeadAir")` generates banter only after 25s of explicitly idle
-  playback, with no pending clip and a connected viewer. It refers to the last visible
-  event and does not invent new activity. Provider calls time out after 30s each.
-- Speaker personas and voice IDs live in `worker/personas.ts`.
+- `RealtimeCommentator` (`worker/realtime.ts`) holds **one persistent Realtime WebSocket**
+  per session. Each action is sent as a `conversation.item.create` + `response.create`;
+  audio deltas are concatenated and wrapped in a WAV container (24 kHz mono PCM16).
+  Conversation history lives in the session, so she does not repeat her own jokes.
+- The commentator's persona and prompts live in `worker/commentator.ts`. There is exactly
+  one commentator: **Vera Merge**.
+- `@callable() processEvent(actionText, eventId?)` returns the clip (transcript + base64 WAV)
+  and pushes it to connected clients. `acknowledgeClip(clipId)` releases the gate only once
+  that audio has finished, so actions cannot overlap.
+- After 25s of explicitly idle playback, `checkDeadAir` produces one grounded idle remark
+  about the last visible action.
+- Besides the agent WebSocket, the Worker exposes a plain JSON bridge the extension uses:
+  `POST /sessions/:id/call` with `{ "method": "processEvent", "args": ["..."] }`.
 
-## Frontend — `app/`
+## Extension — `extension/`
 
-- Dark split-screen UI, Next.js App Router with `output: "export"`.
-- **The Pitch**: a simulated cloud coding agent session (`app/session.ts`) — plan steps,
-  shell commands with streamed stdout/stderr, diffs and git output.
-- Each GO LIVE/restart gets a new UUID-named `useAgent` instance, empty local transcript,
-  and isolated Durable Object state. Tabs and previous runs cannot mix broadcasts.
-- The sequence is `render all step output → paint → processEvent(exact output, eventId)
-  → play matching clip → audio ended → acknowledge → next step`. Slow providers or long
-  clips hold the current step; errors stop the sequence with a visible restart control.
-- **The Broadcast** shows a transcript line when its audio actually starts. Step labels
-  and highlighting identify its source terminal event. There is no audio backlog.
-- The eight-step demo finishes once, then enables idle banter. STOP aborts timers and
-  audio, and late provider responses are discarded. RESTART DEMO creates a fresh run.
-- Browsers block autoplay until a gesture, so the show starts with the **GO LIVE** button.
+- Manifest V3. `content.js` runs on every page; `background.js` is the only thing that
+  talks to the Worker.
+- **Voice-only UI**: a single floating pill in the bottom-right. Click to start or stop.
+  It shows `Listening` / `Thinking` / `Speaking` and animates while she talks. No transcript.
+- **Typing is reported only when you are done with a field** — on blur, on Enter, or after
+  1.5s of no keystrokes — never per character. Password-ish fields report only a character
+  count, never their contents.
+- Only the newest action is voiced; a backlog of stale commentary is dropped.
 
-## Setup
+## Running it locally
 
-```bash
-npm install
-cp .dev.vars.example .dev.vars   # fill in your keys
-npm run dev                      # next build + wrangler dev on :8787
+1. `npm install`
+2. `cp .dev.vars.example .dev.vars` and set `OPENAI_API_KEY` (an OpenAI key with Realtime access).
+3. `npm run dev` — the Worker listens on `http://localhost:8787`. Requires Node 22+.
+4. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select
+   the `extension/` directory.
+5. Open any normal page (not `chrome://`), click the pill in the bottom-right, and use the page.
+   Chrome may require one click on the page before it allows audio.
+
+To point the extension at a deployed Worker, change `WORKER_ORIGIN` at the top of
+`extension/background.js`.
+
+### Verifying the Worker on its own
+
+```
+node scripts/smoke.mjs                       # uses http://localhost:8787
+node scripts/smoke.mjs http://localhost:8787 'The user clicked "Delete account", a button.'
 ```
 
-| Variable             | Required | Notes                                                       |
-| -------------------- | -------- | ----------------------------------------------------------- |
-| `ELEVENLABS_API_KEY` | yes      | Needs `text_to_speech` permission                            |
-| `OPENROUTER_API_KEY` | one of   | Preferred when set                                           |
-| `OPENAI_API_KEY`     | one of   | Fallback                                                     |
-| `LLM_MODEL`          | no       | Defaults to `gpt-4o-mini` / `openai/gpt-4o-mini`             |
-| `ELEVENLABS_MODEL_ID`| no       | Defaults to `eleven_flash_v2_5`                              |
+It prints the spoken line and writes the WAV to `/tmp` so you can play it.
 
-On a free ElevenLabs plan, library voices return `402 paid_plan_required`; the defaults in
-`worker/personas.ts` (Adam + George) work on the free tier.
+## Deploying
 
-## Scripts
-
-```bash
-node scripts/smoke.mjs                # push one event over RPC, write the mp3 to /tmp
-npm test                             # deterministic synchronization and prompt regressions (Node 24)
-node scripts/sync-smoke.mjs           # live providers: isolation, correlation, playback gate and idle banter
-npm run typecheck
-npm run deploy                        # wrangler deploy (set secrets with `wrangler secret put`)
 ```
+npx wrangler secret put OPENAI_API_KEY
+npm run deploy
+```
+
+Optional vars: `OPENAI_REALTIME_MODEL` (default `gpt-realtime`) and `OPENAI_REALTIME_VOICE`
+(default `marin`).

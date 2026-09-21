@@ -1,14 +1,12 @@
-import { Agent, callable, routeAgentRequest, type Connection } from "agents";
-import { synthesize, toBase64 } from "./elevenlabs";
-import { commentOnEvent, deadAirBanter } from "./llm";
-import { PERSONAS, otherSpeaker, type SpeakerId } from "./personas";
+import { Agent, callable, getAgentByName, routeAgentRequest, type Connection } from "agents";
+import { COMMENTATOR, actionPrompt, deadAirPrompt } from "./commentator";
+import { RealtimeCommentator } from "./realtime";
 
 const DEAD_AIR_INTERVAL_SECONDS = 30;
 const DEAD_AIR_SILENCE_MS = 25_000;
-const TRANSCRIPT_CONTEXT = 6;
 const HISTORY_LIMIT = 50;
 
-export type CodingEvent = {
+export type UserAction = {
   id: string;
   text: string;
   at: number;
@@ -16,7 +14,6 @@ export type CodingEvent = {
 
 export type Segment = {
   id: string;
-  speaker: SpeakerId;
   speakerName: string;
   text: string;
   kind: "event" | "dead-air";
@@ -26,9 +23,8 @@ export type Segment = {
 };
 
 export type BroadcastState = {
-  eventHistory: CodingEvent[];
+  eventHistory: UserAction[];
   transcript: Segment[];
-  nextSpeaker: SpeakerId;
   lastEventAt: number;
   onAir: boolean;
   playbackStatus: "active" | "idle" | "stopped";
@@ -37,16 +33,15 @@ export type BroadcastState = {
 };
 
 export type BroadcastClip = Segment & {
-  /** base64-encoded mp3 from ElevenLabs */
+  /** base64-encoded WAV from OpenAI Realtime */
   audio: string;
-  mimeType: "audio/mpeg";
+  mimeType: "audio/wav";
 };
 
 export class BroadcastAgent extends Agent<Env, BroadcastState> {
   initialState: BroadcastState = {
     eventHistory: [],
     transcript: [],
-    nextSpeaker: "A",
     lastEventAt: 0,
     onAir: false,
     playbackStatus: "stopped",
@@ -54,6 +49,7 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
     pendingClipId: null
   };
 
+  private realtime = new RealtimeCommentator();
   private producing = false;
   private revision = 0;
 
@@ -67,11 +63,11 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
     eventText: string,
     eventId: string = crypto.randomUUID()
   ): Promise<BroadcastClip> {
-    if (!eventText.trim() || !eventId.trim()) throw new Error("An event ID and terminal output are required");
+    if (!eventText.trim() || !eventId.trim()) throw new Error("An event ID and action description are required");
     if (this.producing || this.state.pendingClipId) {
-      throw new Error("Finish the current commentary before submitting another event");
+      throw new Error("Finish the current commentary before submitting another action");
     }
-    const event: CodingEvent = {
+    const event: UserAction = {
       id: eventId,
       text: eventText,
       at: Date.now()
@@ -94,6 +90,7 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
       throw new Error("Invalid playback status");
     }
     this.revision += 1;
+    if (status === "stopped") this.realtime.close();
     this.setState({
       ...this.state,
       onAir: status !== "stopped",
@@ -150,34 +147,21 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
 
   private async produce(
     kind: "event" | "dead-air",
-    event: CodingEvent
+    event: UserAction
   ): Promise<BroadcastClip> {
     this.producing = true;
     const revision = this.revision;
     try {
       return await this.keepAliveWhile(async () => {
         if (revision !== this.revision) throw new Error("Broadcast was cancelled");
-        const speaker = this.state.nextSpeaker;
-        const persona = PERSONAS[speaker];
-        const context = this.state.transcript
-          .slice(-TRANSCRIPT_CONTEXT)
-          .map((s) => `${s.speakerName}: ${s.text}`);
-
-        const text =
-          kind === "event"
-            ? await commentOnEvent(this.env, persona, event.text)
-            : await deadAirBanter(this.env, persona, event.text, context);
-
-        if (revision !== this.revision) throw new Error("Broadcast was cancelled");
-
-        const audio = toBase64(await synthesize(this.env, persona.voiceId, text));
+        const prompt = kind === "event" ? actionPrompt(event.text) : deadAirPrompt(event.text);
+        const line = await this.realtime.commentate(this.env, prompt);
         if (revision !== this.revision) throw new Error("Broadcast was cancelled");
 
         const segment: Segment = {
           id: crypto.randomUUID(),
-          speaker,
-          speakerName: persona.name,
-          text,
+          speakerName: COMMENTATOR.name,
+          text: line.text,
           kind,
           eventId: event.id,
           eventText: event.text,
@@ -187,11 +171,10 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
         this.setState({
           ...this.state,
           transcript: [...this.state.transcript, segment].slice(-HISTORY_LIMIT),
-          nextSpeaker: otherSpeaker(speaker),
           pendingClipId: segment.id
         });
 
-        const clip: BroadcastClip = { ...segment, audio, mimeType: "audio/mpeg" };
+        const clip: BroadcastClip = { ...segment, audio: line.audio, mimeType: "audio/wav" };
         this.broadcast(JSON.stringify({ type: "clip", clip }));
         return clip;
       });
@@ -201,11 +184,62 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
   }
 }
 
+type AgentStub = {
+  processEvent: (text: string, eventId?: string) => Promise<BroadcastClip>;
+  acknowledgeClip: (clipId: string) => Promise<void>;
+  setPlaybackStatus: (status: BroadcastState["playbackStatus"]) => Promise<void>;
+  getTranscript: () => Promise<Segment[]>;
+};
+
+const CORS = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "POST, OPTIONS",
+  "access-control-allow-headers": "content-type"
+};
+
+const METHODS: Record<string, (stub: AgentStub, args: unknown[]) => Promise<unknown>> = {
+  processEvent: (stub, [text, eventId]) =>
+    stub.processEvent(String(text), eventId === undefined ? undefined : String(eventId)),
+  acknowledgeClip: (stub, [clipId]) => stub.acknowledgeClip(String(clipId)),
+  setPlaybackStatus: (stub, [status]) =>
+    stub.setPlaybackStatus(status as BroadcastState["playbackStatus"]),
+  getTranscript: (stub) => stub.getTranscript()
+};
+
+async function handleSessionCall(request: Request, env: Env, name: string): Promise<Response> {
+  let body: { method?: string; args?: unknown[] };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return Response.json({ error: "Expected a JSON body" }, { status: 400, headers: CORS });
+  }
+  const handler = body.method ? METHODS[body.method] : undefined;
+  if (!handler) return Response.json({ error: "Unknown method" }, { status: 404, headers: CORS });
+  try {
+    const stub = (await getAgentByName(env.BroadcastAgent, name)) as unknown as AgentStub;
+    const result = await handler(stub, Array.isArray(body.args) ? body.args : []);
+    return Response.json({ result }, { headers: CORS });
+  } catch (error) {
+    return Response.json(
+      { error: error instanceof Error ? error.message : String(error) },
+      { status: 500, headers: CORS }
+    );
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    return (
-      (await routeAgentRequest(request, env)) ??
-      env.ASSETS.fetch(request)
-    );
+    const url = new URL(request.url);
+    const sessionCall = url.pathname.match(/^\/sessions\/([A-Za-z0-9_-]{1,64})\/call$/);
+    if (request.method === "OPTIONS" && sessionCall) {
+      return new Response(null, { headers: CORS });
+    }
+    if (request.method === "POST" && sessionCall) {
+      return handleSessionCall(request, env, sessionCall[1]);
+    }
+    if (request.method === "GET" && url.pathname === "/health") {
+      return new Response("ok");
+    }
+    return (await routeAgentRequest(request, env)) ?? new Response("Not found", { status: 404 });
   }
 } satisfies ExportedHandler<Env>;

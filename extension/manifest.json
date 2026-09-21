@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Sarcastic Peer Programmer",
+  "version": "0.1.0",
+  "description": "A sarcastic commentator that watches what you do on the page and heckles you out loud.",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Sarcastic Peer Programmer" },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

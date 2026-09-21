@@ -1,7 +1,6 @@
 {
   "extends": "agents/tsconfig",
   "compilerOptions": {
-    "jsx": "preserve",
     "lib": [
       "ES2022",
       "DOM",
@@ -10,30 +9,17 @@
     "types": [
       "./worker-configuration.d.ts"
     ],
-    "allowJs": true,
+    "allowJs": false,
     "incremental": true,
-    "plugins": [
-      {
-        "name": "next"
-      }
-    ],
-    "paths": {
-      "@/*": [
-        "./*"
-      ]
-    },
     "module": "esnext",
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "noEmit": true
   },
   "include": [
-    "next-env.d.ts",
-    "**/*.ts",
-    "**/*.tsx",
-    ".next/types/**/*.ts"
+    "worker/**/*.ts"
   ],
   "exclude": [
     "node_modules",
-    "out",
-    ".next"
+    "extension"
   ]
 }

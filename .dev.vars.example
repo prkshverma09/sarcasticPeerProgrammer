@@ -1,4 +1,4 @@
-ELEVENLABS_API_KEY=
-# One of the two below is required for commentary generation.
-OPENROUTER_API_KEY=
 OPENAI_API_KEY=
+# Optional overrides
+OPENAI_REALTIME_MODEL=gpt-realtime
+OPENAI_REALTIME_VOICE=marin
