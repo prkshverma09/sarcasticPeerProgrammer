@@ -34,7 +34,8 @@ Chrome extension                 Cloudflare Worker
 
 - Manifest V3. `content.js` runs on every page; `background.js` is the only thing that
   talks to the Worker.
-- **Voice-only UI**: a single floating pill in the bottom-right. Click to start or stop.
+- **Voice-only UI**: a single floating pill in the bottom-right. Click it — or the toolbar
+  icon, which has no popup — to start or stop.
   It shows `Listening` / `Thinking` / `Speaking` and animates while she talks. No transcript.
 - **Typing is reported only when you are done with a field** — on blur, on Enter, or after
   1.5s of no keystrokes — never per character. Password-ish fields report only a character
@@ -48,7 +49,8 @@ Chrome extension                 Cloudflare Worker
 3. `npm run dev` — the Worker listens on `http://localhost:8787`. Requires Node 22+.
 4. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select
    the `extension/` directory.
-5. Open any normal page (not `chrome://`), click the pill in the bottom-right, and use the page.
+5. Open any normal page (not `chrome://`) — reload tabs that were already open — then click the
+   pill in the bottom-right or the toolbar icon, and use the page.
    Chrome may require one click on the page before it allows audio.
 
 To point the extension at a deployed Worker, change `WORKER_ORIGIN` at the top of
