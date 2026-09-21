@@ -98,8 +98,12 @@ export class BroadcastAgent extends Agent<Env, BroadcastState> {
     if (!["active", "idle", "stopped"].includes(status)) {
       throw new Error("Invalid playback status");
     }
-    this.revision += 1;
-    if (status === "stopped") this.realtime.close();
+    // Only a stop invalidates work in flight. Tabs come and go independently,
+    // so one tab going active must not cancel the line another tab is awaiting.
+    if (status === "stopped") {
+      this.revision += 1;
+      this.realtime.close();
+    }
     this.setState({
       ...this.state,
       onAir: status !== "stopped",

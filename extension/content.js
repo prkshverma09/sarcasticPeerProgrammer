@@ -75,6 +75,7 @@ let ui = null;
 function overlay() {
   if (ui) return ui;
   const host = document.createElement("div");
+  host.dataset.sarcasticPeerProgrammer = "";
   host.style.cssText = "position:fixed;z-index:2147483647;right:16px;bottom:16px;";
   const root = host.attachShadow({ mode: "open" });
   root.innerHTML = `
@@ -132,6 +133,11 @@ async function playClip(clip) {
       audio.onerror = () => reject(new Error("audio playback failed"));
       audio.play().catch(reject);
     });
+  } catch (error) {
+    // Starting from the toolbar icon is not a page gesture, so Chrome blocks
+    // autoplay until the page itself is touched. Drop the line rather than
+    // parking the pill on Error over something the next click fixes.
+    if (error.name !== "NotAllowedError") throw error;
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -165,8 +171,8 @@ async function drain() {
   }
 }
 
-// Re-sending a status the worker already has bumps its revision and cancels the
-// line it is mid-way through generating, so only send transitions.
+// The worker has nothing to do with a status it already holds: only send
+// transitions rather than one message per action.
 let playbackStatus = null;
 function setPlaybackStatus(status) {
   if (status === playbackStatus) return;
@@ -318,6 +324,10 @@ chrome.runtime.onMessage.addListener((message) => {
     })();
   }
 });
+
+// An extension reload orphans the previous content script but leaves its pill
+// in the page; the fallback injection would then stack a second one.
+for (const stale of document.querySelectorAll("[data-sarcastic-peer-programmer]")) stale.remove();
 
 overlay();
 setState("Listen in");
