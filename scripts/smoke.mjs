@@ -1,43 +1,33 @@
-// Smoke test: connects to the BroadcastAgent over WebSocket RPC, pushes a coding
-// event, and writes the returned ElevenLabs audio to /tmp so it can be played back.
-// Usage: node scripts/smoke.mjs [host] ["event text"]
+// Smoke test: posts a user action to the worker's HTTP bridge (the same one the
+// extension uses) and writes the returned OpenAI Realtime audio to /tmp.
+// Usage: node scripts/smoke.mjs [origin] ["action description"]
 import { writeFileSync } from "node:fs";
-import { AgentClient } from "agents/client";
 
-const host = process.argv[2] ?? "localhost:8787";
-const eventText = process.argv[3] ?? "Terminal: npm run build failed with 147 TypeScript errors";
+const origin = process.argv[2] ?? "http://localhost:8787";
+const action = process.argv[3] ??
+  'The user clicked "Force push", a button, on the page "Pull request #42".';
+const session = `smoke-${crypto.randomUUID()}`;
 
-const client = new AgentClient({
-  agent: "BroadcastAgent",
-  name: "smoke-test",
-  host
-});
+async function call(method, args = []) {
+  const res = await fetch(`${origin}/sessions/${session}/call`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ method, args })
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error ?? `worker returned ${res.status}`);
+  return data.result;
+}
 
-client.onmessage = (event) => {
-  try {
-    const data = JSON.parse(event.data);
-    if (data.type === "clip") {
-      console.log(`[broadcast push] ${data.clip.speakerName} (${data.clip.kind}): ${data.clip.text}`);
-    }
-  } catch {}
-};
-
-await new Promise((resolve, reject) => {
-  client.onopen = resolve;
-  client.onerror = reject;
-  setTimeout(() => reject(new Error("timed out connecting")), 15_000);
-});
-
-console.log(`connected to ${host}, sending: ${eventText}`);
+console.log(`sending to ${origin}: ${action}`);
 const started = Date.now();
-const clip = await client.call("processEvent", [eventText]);
+const clip = await call("processEvent", [action]);
 const bytes = Buffer.from(clip.audio, "base64");
-const out = `/tmp/devincast-${clip.speaker}-${clip.id.slice(0, 8)}.mp3`;
+const out = `/tmp/spp-${clip.id.slice(0, 8)}.wav`;
 writeFileSync(out, bytes);
+await call("acknowledgeClip", [clip.id]);
 
-console.log(`speaker : ${clip.speakerName} (${clip.speaker})`);
-console.log(`line    : ${clip.text}`);
-console.log(`audio   : ${bytes.length} bytes -> ${out}`);
-console.log(`latency : ${Date.now() - started} ms`);
-client.close();
-process.exit(0);
+console.log(`commentator : ${clip.speakerName}`);
+console.log(`line        : ${clip.text}`);
+console.log(`audio       : ${bytes.length} bytes -> ${out}`);
+console.log(`latency     : ${Date.now() - started} ms`);
