@@ -305,6 +305,10 @@ function stop() {
 }
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (message.kind === "toggle") {
+    live ? stop() : void start();
+    return;
+  }
   if (message.kind !== "broadcast" || !live) return;
   const { data } = message;
   if (data.type === "clip" && data.clip.kind === "dead-air" && !speaking) {

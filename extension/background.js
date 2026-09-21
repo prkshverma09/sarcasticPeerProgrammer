@@ -69,6 +69,18 @@ function closePushSocket() {
   try { ws?.close(); } catch {}
 }
 
+// The toolbar icon has no popup: it toggles the in-page pill. Tabs opened
+// before the extension loaded have no content script yet, so inject one.
+chrome.action.onClicked.addListener(async (tab) => {
+  if (!tab.id || !/^https?:/.test(tab.url || "")) return;
+  try {
+    await chrome.tabs.sendMessage(tab.id, { kind: "toggle" });
+  } catch {
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+    await chrome.tabs.sendMessage(tab.id, { kind: "toggle" }).catch(() => {});
+  }
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     const state = await getLive();
